@@ -7,7 +7,7 @@ from PIL import Image
 
 from diffusers import StableDiffusionPipeline
 from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPProcessor, CLIPModel
 
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 from tqdm.auto import tqdm
@@ -16,7 +16,8 @@ from tqdm.auto import tqdm
 class Config:
     GUIDANCE_SCALE = 7.5
     INFERENCE_STEPS = 50
-    SEED = 30
+    SEED = 150
+    CUSTOM_LOSS_SCALE = 100
 
 class DiffuserModels:
 
@@ -41,6 +42,9 @@ class DiffuserModels:
         self.text_encoder = self.text_encoder.to(torch_device)
         self.unet = self.unet.to(torch_device)
         self.torch_device = torch_device
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        self.clip_model.eval()
 
 def get_stable_diffusion_pipeline(pretrained_model_name, torch_device):
     pipe = StableDiffusionPipeline.from_pretrained(
@@ -67,7 +71,29 @@ def latents_to_pil(latents, vae):
     return pil_images
 
 
-def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text_input_max_length ):
+def blue_loss(images):
+    print(f"images shape: {images.shape}")
+    # How far are the blue channel values to 0.9:
+    error = torch.abs(images[:,2] - 0.9).mean() # [:,2] -> all images in batch, only the blue channel
+    print(f"blue error shape: {error.shape}")
+    print(f"blue error: {error}")
+    return error
+
+def get_prompt_based_custom_loss(models : DiffuserModels, denoised_images, prompt = "zebra lines background"):
+    
+    uncond_input = models.tokenizer( [prompt] * 1, padding="max_length", max_length=models.tokenizer.model_max_length, return_tensors="pt" )    
+    with torch.no_grad():
+        updated_embeddings = models.text_encoder(uncond_input.input_ids.to(models.torch_device))[0]
+    
+    new_embeddings = torch.cat([updated_embeddings] * 2)
+    print(f"new_embeddings.shape: {new_embeddings.shape}")
+    print(f"new_embeddings: {new_embeddings}")
+
+    return new_embeddings
+
+
+
+def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text_input_max_length, apply_custom_loss_guidance = False ):
     height = 512                        # default height of Stable Diffusion
     width = 512                         # default width of Stable Diffusion
     num_inference_steps = Config.INFERENCE_STEPS            # Number of denoising steps
@@ -96,6 +122,7 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
         latent_model_input = torch.cat([latents] * 2)
         sigma = models.scheduler.sigmas[i]
         latent_model_input = models.scheduler.scale_model_input(latent_model_input, t)
+        print(f"latent_model_input.shape: {latent_model_input.shape}")
 
         # predict the noise residual
         with torch.no_grad():
@@ -105,8 +132,41 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+        # print(f"noise_pred: {noise_pred}")
+        print(f"noise_pred.shape: {noise_pred.shape}")
+
+        if(apply_custom_loss_guidance):
+            #### ADDITIONAL GUIDANCE ###
+            if i%5 == 0:
+                    # Requires grad on the latents
+                    latents = latents.detach().requires_grad_()
+
+                    # Get the predicted x0:
+                    latents_x0 = latents - sigma * noise_pred
+                    # latents_x0 = scheduler.step(noise_pred, t, latents).pred_original_sample
+
+                    # Decode to image space
+                    denoised_images = models.vae.decode((1 / 0.18215) * latents_x0).sample / 2 + 0.5 # range (0, 1)
+
+                    # Calculate loss
+
+                    get_prompt_based_custom_loss(models, denoised_images)
+
+                    loss = blue_loss(denoised_images) * Config.CUSTOM_LOSS_SCALE                   
+                    
+                    print(i, 'loss:', loss.item(), loss.shape)
+
+                    # Get gradient
+                    cond_grad = torch.autograd.grad(loss, latents)[0]
+
+                    # Modify the latents based on this gradient
+                    latents = latents.detach() - cond_grad * sigma**2
+                    print(f"latents.shape: {latents.shape}")
+
+
         # compute the previous noisy sample x_t -> x_t-1
         latents = models.scheduler.step(noise_pred, t, latents).prev_sample
+        
 
     return latents
 
