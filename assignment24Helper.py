@@ -4,6 +4,7 @@ import math
 
 import PIL
 from PIL import Image
+import torchvision.transforms as transforms
 
 from diffusers import StableDiffusionPipeline
 from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
@@ -11,6 +12,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPProcessor, CLIPModel
 
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 from tqdm.auto import tqdm
+import numpy as np
 
 
 class Config:
@@ -45,6 +47,21 @@ class DiffuserModels:
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
         self.clip_model.eval()
+        self.clip_model.to(torch_device)
+
+
+def load_style_image():    
+    
+    img = Image.open("style1.png").convert('RGB') 
+    transform = transforms.Compose([
+            transforms.Resize((512, 512)),  # Resize to desired dimensions
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+    img_tensor = transform(img)
+    img_tensor = img_tensor.unsqueeze(0)
+    print(f"img_tensor.shape : {img_tensor.shape}")
+    return img_tensor
 
 def get_stable_diffusion_pipeline(pretrained_model_name, torch_device):
     pipe = StableDiffusionPipeline.from_pretrained(
@@ -76,22 +93,10 @@ def blue_loss(images):
     # How far are the blue channel values to 0.9:
     error = torch.abs(images[:,2] - 0.9).mean() # [:,2] -> all images in batch, only the blue channel
     print(f"blue error shape: {error.shape}")
-    print(f"blue error: {error}")
     return error
 
-def get_prompt_based_custom_loss(models : DiffuserModels, denoised_images, prompt = "zebra lines background"):
-    
-    uncond_input = models.tokenizer( [prompt] * 1, padding="max_length", max_length=models.tokenizer.model_max_length, return_tensors="pt" )    
-    with torch.no_grad():
-        updated_embeddings = models.text_encoder(uncond_input.input_ids.to(models.torch_device))[0]
-    
-    new_embeddings = torch.cat([updated_embeddings] * 2)
-    print(f"new_embeddings.shape: {new_embeddings.shape}")
-    print(f"new_embeddings: {new_embeddings}")
-
-    return new_embeddings
-
-
+def clip_loss(style_embedding, generated_embedding):
+    return torch.nn.functional.cosine_similarity(style_embedding, generated_embedding, dim=-1).mean()
 
 def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text_input_max_length, apply_custom_loss_guidance = False ):
     height = 512                        # default height of Stable Diffusion
@@ -115,6 +120,8 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
     latents = torch.randn((batch_size, models.unet.in_channels, height // 8, width // 8), generator=generator)
     latents = latents.to(models.torch_device)
     latents = latents * models.scheduler.init_noise_sigma
+    style_image = load_style_image()
+    style_image = (style_image + 1) / 2
 
     # Loop
     for i, t in tqdm(enumerate(models.scheduler.timesteps), total=len(models.scheduler.timesteps)):
@@ -146,15 +153,28 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
                     # latents_x0 = scheduler.step(noise_pred, t, latents).pred_original_sample
 
                     # Decode to image space
-                    denoised_images = models.vae.decode((1 / 0.18215) * latents_x0).sample / 2 + 0.5 # range (0, 1)
+                    de_noised_images = models.vae.decode((1 / 0.18215) * latents_x0).sample / 2 + 0.5 # range (0, 1)
+                    de_noised_images = torch.clamp(de_noised_images, min=0, max=1)
+
+                    print(f"denoised_images.shape: {de_noised_images.shape}, {type(de_noised_images)}")
+                    print(f"style_image.shape: {style_image.shape}")
 
                     # Calculate loss
 
-                    get_prompt_based_custom_loss(models, denoised_images)
+                    # Preprocess images
+                    style_image_tensor = models.clip_processor(images=style_image, return_tensors="pt").to(models.torch_device)
+                    generated_image_tensor = models.clip_processor(images=de_noised_images, return_tensors="pt").to(models.torch_device)
 
-                    loss = blue_loss(denoised_images) * Config.CUSTOM_LOSS_SCALE                   
+                    print(style_image_tensor.keys())
+
+                    # Calculate CLIP embeddings
+                    style_embedding = models.clip_model.get_image_features(**style_image_tensor)
+                    generated_embedding = models.clip_model.get_image_features(**generated_image_tensor)
+
+
+                    loss = clip_loss(style_embedding, generated_embedding)   * Config.CUSTOM_LOSS_SCALE           
                     
-                    print(i, 'loss:', loss.item(), loss.shape)
+                    print(i, 'loss:', loss.item())
 
                     # Get gradient
                     cond_grad = torch.autograd.grad(loss, latents)[0]
