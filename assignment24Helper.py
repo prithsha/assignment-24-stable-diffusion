@@ -13,6 +13,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPProcessor, CLIPModel
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 from tqdm.auto import tqdm
 import numpy as np
+import torch.nn as nn
 
 
 class Config:
@@ -49,10 +50,9 @@ class DiffuserModels:
         self.clip_model.eval()
         self.clip_model.to(torch_device)
 
-
 def load_style_image():    
     
-    img = Image.open("style1.png").convert('RGB') 
+    img = Image.open("style2.png").convert('RGB') 
     transform = transforms.Compose([
             transforms.Resize((512, 512)),  # Resize to desired dimensions
             transforms.ToTensor(),
@@ -60,7 +60,7 @@ def load_style_image():
         ])
     img_tensor = transform(img)
     img_tensor = img_tensor.unsqueeze(0)
-    print(f"img_tensor.shape : {img_tensor.shape}")
+    # print(f"img_tensor.shape : {img_tensor.shape}")
     return img_tensor
 
 def get_stable_diffusion_pipeline(pretrained_model_name, torch_device):
@@ -87,7 +87,6 @@ def latents_to_pil(latents, vae):
     pil_images = [Image.fromarray(image) for image in images]
     return pil_images
 
-
 def blue_loss(images):
     print(f"images shape: {images.shape}")
     # How far are the blue channel values to 0.9:
@@ -98,11 +97,11 @@ def blue_loss(images):
 def clip_loss(style_embedding, generated_embedding):
     return torch.nn.functional.cosine_similarity(style_embedding, generated_embedding, dim=-1).mean()
 
-def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text_input_max_length, apply_custom_loss_guidance = False ):
-    height = 512                        # default height of Stable Diffusion
-    width = 512                         # default width of Stable Diffusion
+def generate_with_embs_blue_loss(models : DiffuserModels, text_embeddings, generator, text_input_max_length, apply_custom_loss_guidance = False ):
+    height = 512                                            # default height of Stable Diffusion
+    width = 512                                             # default width of Stable Diffusion
     num_inference_steps = Config.INFERENCE_STEPS            # Number of denoising steps
-    guidance_scale = Config.GUIDANCE_SCALE                # Scale for classifier-free guidance
+    guidance_scale = Config.GUIDANCE_SCALE                  # Scale for classifier-free guidance
     batch_size = 1
 
     uncond_input = models.tokenizer(
@@ -129,7 +128,6 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
         latent_model_input = torch.cat([latents] * 2)
         sigma = models.scheduler.sigmas[i]
         latent_model_input = models.scheduler.scale_model_input(latent_model_input, t)
-        print(f"latent_model_input.shape: {latent_model_input.shape}")
 
         # predict the noise residual
         with torch.no_grad():
@@ -139,43 +137,26 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        # print(f"noise_pred: {noise_pred}")
-        print(f"noise_pred.shape: {noise_pred.shape}")
-
         if(apply_custom_loss_guidance):
             #### ADDITIONAL GUIDANCE ###
             if i%5 == 0:
                     # Requires grad on the latents
-                    latents = latents.detach().requires_grad_()
+                    latents = latents.detach()                    
+                    latents.requires_grad_(True)
 
                     # Get the predicted x0:
                     latents_x0 = latents - sigma * noise_pred
-                    # latents_x0 = scheduler.step(noise_pred, t, latents).pred_original_sample
 
                     # Decode to image space
                     de_noised_images = models.vae.decode((1 / 0.18215) * latents_x0).sample / 2 + 0.5 # range (0, 1)
                     de_noised_images = torch.clamp(de_noised_images, min=0, max=1)
 
-                    print(f"denoised_images.shape: {de_noised_images.shape}, {type(de_noised_images)}")
-                    print(f"style_image.shape: {style_image.shape}")
-
                     # Calculate loss
-
-                    # Preprocess images
-                    style_image_tensor = models.clip_processor(images=style_image, return_tensors="pt").to(models.torch_device)
-                    generated_image_tensor = models.clip_processor(images=de_noised_images, return_tensors="pt").to(models.torch_device)
-
-                    print(style_image_tensor.keys())
-
-                    # Calculate CLIP embeddings
-                    style_embedding = models.clip_model.get_image_features(**style_image_tensor)
-                    generated_embedding = models.clip_model.get_image_features(**generated_image_tensor)
-
-
-                    loss = clip_loss(style_embedding, generated_embedding)   * Config.CUSTOM_LOSS_SCALE           
+                    loss = blue_loss(de_noised_images) * Config.CUSTOM_LOSS_SCALE
                     
                     print(i, 'loss:', loss.item())
-
+                    print(f"loss: {loss}")
+                    
                     # Get gradient
                     cond_grad = torch.autograd.grad(loss, latents)[0]
 
@@ -188,6 +169,69 @@ def generate_with_embs(models : DiffuserModels, text_embeddings, generator, text
         latents = models.scheduler.step(noise_pred, t, latents).prev_sample
         
 
+    return latents
+
+def generate_with_embs_with_clip_latents(models : DiffuserModels, text_embeddings, generator, text_input_max_length, apply_custom_loss_guidance = False ):
+    height = 512                                            # default height of Stable Diffusion
+    width = 512                                             # default width of Stable Diffusion
+    num_inference_steps = Config.INFERENCE_STEPS            # Number of denoising steps
+    guidance_scale = Config.GUIDANCE_SCALE                  # Scale for classifier-free guidance
+    batch_size = 1
+
+    uncond_input = models.tokenizer(
+                [""] * batch_size, padding="max_length",
+                max_length=text_input_max_length, return_tensors="pt" )
+    with torch.no_grad():
+        uncond_embeddings = models.text_encoder(uncond_input.input_ids.to(models.torch_device))[0]    
+    text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+    # Prep Scheduler
+    set_timesteps(models.scheduler, num_inference_steps)
+
+    # Prep latents
+    latents = torch.randn((batch_size, models.unet.in_channels, height // 8, width // 8), generator=generator)
+    latents = latents.to(models.torch_device)
+    latents = latents * models.scheduler.init_noise_sigma
+    style_image = load_style_image()
+    style_image = (style_image + 1) / 2
+    style_image = style_image.to(models.torch_device)
+
+    # Loop
+    for i, t in tqdm(enumerate(models.scheduler.timesteps), total=len(models.scheduler.timesteps)):
+        # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+        latent_model_input = torch.cat([latents] * 2)
+        sigma = models.scheduler.sigmas[i]
+        latent_model_input = models.scheduler.scale_model_input(latent_model_input, t)
+
+        # predict the noise residual
+        with torch.no_grad():
+            noise_pred = models.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
+
+        # perform guidance
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        if(apply_custom_loss_guidance):
+            #### ADDITIONAL GUIDANCE ###
+            if i%5 == 0:
+                    # Requires grad on the latents
+                    latents = latents.detach()                    
+                    latents.requires_grad_(True)
+
+                    # Get the predicted x0:
+                    latents_x0 = latents - sigma * noise_pred
+                    style_image_tensor = models.clip_processor(images=style_image, return_tensors="pt").to(models.torch_device)
+
+                    # # Calculate CLIP embeddings
+                    style_embedding = models.clip_model.get_image_features(**style_image_tensor)
+
+                    projection = nn.Linear(768, 4*64*64).to(models.torch_device)
+                    projected_features = projection(style_embedding)
+                    projected_features = projected_features.view(latents.shape)
+                    latents = latents_x0 + projected_features * sigma**2
+
+        # compute the previous noisy sample x_t -> x_t-1
+        latents = models.scheduler.step(noise_pred, t, latents).prev_sample
+        
     return latents
 
 
