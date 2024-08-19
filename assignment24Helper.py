@@ -234,7 +234,6 @@ def generate_with_embs_with_clip_latents(models : DiffuserModels, text_embedding
         
     return latents
 
-
 def get_output_embeds(models : DiffuserModels, input_embeddings):
     # CLIP's text model uses causal mask, so we prepare it here:
     bsz, seq_len = input_embeddings.shape[:2]
