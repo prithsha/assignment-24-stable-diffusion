@@ -212,22 +212,30 @@ def generate_with_embs_with_clip_latents(models : DiffuserModels, text_embedding
 
         if(apply_custom_loss_guidance):
             #### ADDITIONAL GUIDANCE ###
-            if i%5 == 0:
+            if i%1 == 0:
                     # Requires grad on the latents
                     latents = latents.detach()                    
-                    latents.requires_grad_(True)
+                    # latents.requires_grad_(True)
 
-                    # Get the predicted x0:
+                    # # Get the predicted x0:
                     latents_x0 = latents - sigma * noise_pred
+                    # de_noised_images = models.vae.decode((1 / 0.18215) * latents_x0).sample / 2 + 0.5 # range (0, 1)
+                    # de_noised_images = torch.clamp(de_noised_images, min=0, max=1)
+
+                    # # Preprocess images                    
+                    # generated_image_tensor = models.clip_processor(images=de_noised_images, return_tensors="pt").to(models.torch_device)
+                    # generated_embedding = models.clip_model.get_image_features(**generated_image_tensor)
+
                     style_image_tensor = models.clip_processor(images=style_image, return_tensors="pt").to(models.torch_device)
 
                     # # Calculate CLIP embeddings
                     style_embedding = models.clip_model.get_image_features(**style_image_tensor)
+                    # difference_mean = clip_loss(style_embedding, generated_embedding).mean()
 
                     projection = nn.Linear(768, 4*64*64).to(models.torch_device)
                     projected_features = projection(style_embedding)
                     projected_features = projected_features.view(latents.shape)
-                    latents = latents_x0 + projected_features * sigma**2
+                    latents = latents_x0 + projected_features
 
         # compute the previous noisy sample x_t -> x_t-1
         latents = models.scheduler.step(noise_pred, t, latents).prev_sample
@@ -260,3 +268,49 @@ def get_output_embeds(models : DiffuserModels, input_embeddings):
 
     # And now they're ready!
     return output
+
+def initialize_model(model_name, torch_device, prompt_replacement_text = "flower"):
+
+    models = DiffuserModels(model_name=model_name, torch_device=torch_device)
+
+    prompt = prompt_replacement_text
+    tokens = models.tokenizer(prompt)
+    # print('tokenizer(prompt):', tokens)
+
+    selected_token = tokens["input_ids"][1]
+    pos_emb_layer = models.text_encoder.text_model.embeddings.position_embedding
+    token_emb_layer = models.text_encoder.text_model.embeddings.token_embedding
+    position_ids = models.text_encoder.text_model.embeddings.position_ids[:, :77]
+    position_embeddings = pos_emb_layer(position_ids)
+
+    return models, selected_token, token_emb_layer, position_embeddings
+
+def get_token_embedding_for_prompt(models : DiffuserModels, token_emb_layer, prompt="A cinematic hand made wall poster of girl with umbrella and red flower"):
+    
+    text_input = models.tokenizer(prompt, padding="max_length",
+                              max_length=models.tokenizer.model_max_length,
+                              truncation=True, return_tensors="pt")
+    input_ids = text_input.input_ids.to(models.torch_device)
+    token_embeddings = token_emb_layer(input_ids)
+    # Only printing first 20 tokens
+    # print('tokenizer(prompt):', input_ids[0][:20], input_ids[0].shape)
+    return input_ids, token_embeddings
+
+def get_embedding_for_concept_library(library_name, torch_device):
+    embedding_directory = "embeddings"
+    selected_name = library_name.split("/")[1]
+    embeddings = torch.load(os.path.join(os.getcwd(), embedding_directory, selected_name + "-learned_embeds.bin"))
+    replacement_token_embedding = embeddings[list(embeddings.keys())[0]].to(torch_device)
+    return replacement_token_embedding
+
+def execute_diffusion_for_concept_library(models, input_embeddings, text_input_max_length, seed, apply_custom_loss_guidance= False):
+
+    generator = torch.Generator(device="cpu").manual_seed(seed) 
+    #  Feed through to get final output embs
+    modified_output_embeddings = get_output_embeds(models=models, input_embeddings= input_embeddings)    
+    latents = generate_with_embs_with_clip_latents(models=models, text_embeddings= modified_output_embeddings,
+                                     generator=generator,
+                                     text_input_max_length=text_input_max_length,
+                                     apply_custom_loss_guidance=apply_custom_loss_guidance
+                                     )
+    return latents_to_pil(latents, models.vae)[0]
